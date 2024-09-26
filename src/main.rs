@@ -1,14 +1,23 @@
 use crossterm::event::Event;
+use env_logger;
+use log::{debug, info, warn};
 use nvml_wrapper::{enum_wrappers::device::TemperatureSensor, Nvml};
-
 use ratatui::{
-    crossterm::event::{self,KeyCode,KeyEventKind}, layout::{Constraint, Layout}, style::{Style, Stylize}, symbols::Marker, widgets::{block::Title, Axis, Block, Chart, Dataset, Widget}, DefaultTerminal, Frame
+    crossterm::event::{self, KeyCode, KeyEventKind},
+    layout::{Constraint, Layout, Rect},
+    style::Style,
+    symbols::Marker,
+    widgets::{block::Title, Axis, Block, Chart, Dataset, Widget},
+    DefaultTerminal, Frame,
 };
+use std::thread;
+use std::time::Duration;
 
 mod tests;
 
 fn main() {
-    // get_nvidia_gpu_info();
+    env_logger::init();
+    info!("Starting application");
     run_tui();
 }
 
@@ -17,53 +26,189 @@ fn run_tui() {
     terminal.clear().expect("Failed to clear terminal");
 
     let mut app = NvidiaApp::default();
-    let app_result = app.run_app(&mut terminal);
+    let _app_result = app.run_app(&mut terminal);
 
     ratatui::restore();
 }
 
 #[derive(Debug, Default)]
 struct NvidiaApp {
-    gpu_core_clock: [u32;30],
-    gpu_temperature: [u32;30],
-    gpu_device: String,
+    gpus: Vec<GPUInfo>,
     exit: bool,
+}
+
+#[derive(Debug, Default)]
+struct GPUInfo {
+    core_clock: [u32; 30],
+    temperature: [u32; 30],
+    device_name: String,
 }
 
 impl NvidiaApp {
     pub fn run_app(&mut self, terminal: &mut DefaultTerminal) -> std::io::Result<()> {
         let nvml = Nvml::init().expect("Failed to initialize NVML");
-        let gpu_device = nvml.device_by_index(0).expect("Failed to get device index 0");
-        self.gpu_device = gpu_device.name().expect("Failed to get GPU part number");
-        
+        let device_count = nvml.device_count().expect("Failed to get device count");
+        debug!("Found {} devices", device_count);
+
+        if device_count == 0 {
+            eprintln!("Error: No GPUs found. Please ensure that your system has NVIDIA GPUs installed and try again.");
+            std::process::exit(1);
+        }
+
+        for i in 0..device_count {
+            let gpu_device = nvml
+                .device_by_index(i)
+                .expect("Failed to get device by index");
+            let device_name = gpu_device.name().expect("Failed to get GPU name");
+            debug!("Found device: {}", device_name);
+            self.gpus.push(GPUInfo {
+                core_clock: [0; 30],
+                temperature: [0; 30],
+                device_name,
+            });
+        }
 
         while !self.exit {
             self.update_state()?;
             let _ = terminal.draw(|frame| self.draw(frame))?;
             self.handle_events()?;
+            thread::sleep(Duration::from_secs(1));
         }
         Ok(())
     }
 
-    // This function is used to update the main application state
     fn update_state(&mut self) -> std::io::Result<()> {
         let nvml = Nvml::init().expect("Failed to initialize NVML");
-        let gpu_device = nvml.device_by_index(0).expect("Failed to get device index 0");
 
-        // Update GPU Core Clock Speed
-        let current_clock = gpu_device.clock_info(nvml_wrapper::enum_wrappers::device::Clock::Graphics).expect("Failed to retrieve GPU clock speed");
-        self.gpu_core_clock.rotate_left(1);
-        self.gpu_core_clock[29] = current_clock;
+        for (i, gpu_info) in self.gpus.iter_mut().enumerate() {
+            let gpu_device = nvml
+                .device_by_index(i.try_into().unwrap())
+                .expect("Failed to get device by index");
 
-        let gpu_current_temperature = gpu_device.temperature(TemperatureSensor::Gpu).expect("Failed to retrieve GPU temperature");
-        self.gpu_temperature.rotate_left(1);
-        self.gpu_temperature[29] = gpu_current_temperature;
+            let current_clock = gpu_device
+                .clock_info(nvml_wrapper::enum_wrappers::device::Clock::Graphics)
+                .expect("Failed to retrieve GPU clock speed");
+            debug!("GPU {} clock: {}", i, current_clock);
+            gpu_info.core_clock.rotate_left(1);
+            gpu_info.core_clock[29] = current_clock;
+
+            let gpu_current_temperature = gpu_device
+                .temperature(TemperatureSensor::Gpu)
+                .expect("Failed to retrieve GPU temperature");
+            debug!("GPU {} temperature: {}", i, gpu_current_temperature);
+            gpu_info.temperature.rotate_left(1);
+            gpu_info.temperature[29] = gpu_current_temperature;
+        }
 
         Ok(())
     }
 
-    fn draw(&self, frame: &mut Frame) { 
-        frame.render_widget(self, frame.area())
+    fn draw(&self, frame: &mut Frame) {
+        // if number of gpus is less than one then error and exit
+        let num_gpus = self.gpus.len();
+        if num_gpus == 0 {
+            eprintln!("Error: No GPUs found. Please ensure that your system has NVIDIA GPUs installed and try again.");
+            std::process::exit(1);
+        }
+
+        let percentage = 100 / num_gpus as u16;
+
+        let constraints = vec![Constraint::Percentage(percentage); num_gpus];
+
+        let chunks: Vec<Rect> = Layout::default()
+            .direction(ratatui::layout::Direction::Vertical)
+            .constraints(constraints)
+            .split(frame.area())
+            .to_vec();
+
+        for (i, gpu_info) in self.gpus.iter().enumerate() {
+            debug!("Drawing GPU {}: {}", i, gpu_info.device_name);
+            let gpu_chunks: Vec<Rect> = Layout::default()
+                .direction(ratatui::layout::Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+                .split(chunks[i])
+                .to_vec();
+
+            let clock_chunk = gpu_chunks[0];
+            let temp_chunk = gpu_chunks[1];
+
+            let clock_title = Title::from(format!("NVIDIA GPU Clock - {}", gpu_info.device_name));
+            let clock_block = Block::bordered()
+                .border_style(Style::new().fg(ratatui::style::Color::Rgb(117, 255, 0)))
+                .title(clock_title.alignment(ratatui::layout::Alignment::Center));
+
+            let temp_title =
+                Title::from(format!("NVIDIA GPU Temperature - {}", gpu_info.device_name));
+            let temp_block = Block::bordered()
+                .border_style(Style::new().fg(ratatui::style::Color::Rgb(255, 0, 255)))
+                .title(temp_title.alignment(ratatui::layout::Alignment::Center));
+
+            let gpu_clock_data: Vec<(f64, f64)> = gpu_info
+                .core_clock
+                .iter()
+                .zip(-29..=0)
+                .map(|(clock, time)| (time as f64, *clock as f64))
+                .collect();
+            let gpu_temperature_data: Vec<(f64, f64)> = gpu_info
+                .temperature
+                .iter()
+                .zip(-29..=0)
+                .map(|(temp, time)| (time as f64, *temp as f64))
+                .collect();
+
+            let current_clock = gpu_info.core_clock[29].max(1); // Ensure the value is at least 1
+            let current_temp = gpu_info.temperature[29].max(1); // Ensure the value is at least 1
+
+            debug!("Current clock: {}", current_clock);
+            debug!("Current temperature: {}", current_temp);
+
+            let current_clock_str = current_clock.to_string();
+            let current_temp_str = current_temp.to_string();
+
+            let chart_gpu_clock_data = Dataset::default()
+                .name("GPU Clock")
+                .marker(Marker::Dot)
+                .graph_type(ratatui::widgets::GraphType::Line)
+                .data(&gpu_clock_data);
+            let chart_gpu_temperature_data = Dataset::default()
+                .name("GPU Temperature")
+                .marker(Marker::Dot)
+                .graph_type(ratatui::widgets::GraphType::Line)
+                .data(&gpu_temperature_data);
+
+            let chart_gpu_clock_x_axis = Axis::default()
+                .title("Time")
+                .bounds([-30.0, 0.0])
+                .labels(vec!["Time"]);
+            let chart_gpu_clock_y_axis = Axis::default()
+                .title("GPU Clock Speed")
+                .bounds([0.0, current_clock as f64])
+                .labels(vec!["0", current_clock_str.as_str()]);
+
+            let chart_gpu_temperature_x_axis = Axis::default()
+                .title("Time")
+                .bounds([-30.0, 0.0])
+                .labels(vec!["Time"]);
+            // For the temperature chart
+            let chart_gpu_temperature_y_axis = Axis::default()
+                .title("GPU Temperature")
+                .bounds([0.0, current_temp as f64])
+                .labels(vec!["0", current_temp_str.as_str()]);
+
+            let chart_gpu_clock = Chart::new(vec![chart_gpu_clock_data])
+                .block(clock_block.clone())
+                .x_axis(chart_gpu_clock_x_axis)
+                .y_axis(chart_gpu_clock_y_axis)
+                .style(Style::new().fg(ratatui::style::Color::Rgb(48, 226, 173)));
+            chart_gpu_clock.render(clock_chunk, frame.buffer_mut());
+
+            let chart_gpu_temperature = Chart::new(vec![chart_gpu_temperature_data])
+                .block(temp_block.clone())
+                .x_axis(chart_gpu_temperature_x_axis)
+                .y_axis(chart_gpu_temperature_y_axis)
+                .style(Style::new().fg(ratatui::style::Color::Rgb(255, 0, 255)));
+            chart_gpu_temperature.render(temp_chunk, frame.buffer_mut());
+        }
     }
 
     fn handle_events(&mut self) -> std::io::Result<()> {
@@ -74,17 +219,17 @@ impl NvidiaApp {
             Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
                 self.handle_key_event(key_event);
             }
-            _ => {  }
+            _ => {}
         }
         Ok(())
     }
-    
+
     fn handle_key_event(&mut self, key_event: event::KeyEvent) {
         match key_event.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => {
                 self.exit();
-            },
-            _ => { }
+            }
+            _ => {}
         }
     }
 
@@ -95,81 +240,99 @@ impl NvidiaApp {
 
 impl Widget for &NvidiaApp {
     fn render(self, area: ratatui::prelude::Rect, buf: &mut ratatui::prelude::Buffer) {
-        let [parent01, parent02,] = Layout::horizontal(Constraint::from_percentages([50,50])).areas(area);
-
-        let [top01, bottom01] = Layout::vertical(Constraint::from_percentages([50,50])).areas(parent01);
-        let [top02, bottom02] = Layout::vertical(Constraint::from_percentages([50,50])).areas(parent02);
-
-        
-        let title = Title::from(format!("NVIDIA GPU Monitor {0}", self.gpu_device));
-        let block01 = Block::bordered()
-            .border_style(Style::new()
-                .fg(ratatui::style::Color::Rgb(117, 255, 0))
+        let chunks = Layout::default()
+            .direction(ratatui::layout::Direction::Vertical)
+            .constraints(
+                self.gpus
+                    .iter()
+                    .map(|_| Constraint::Percentage(100 / self.gpus.len() as u16))
+                    .collect::<Vec<Constraint>>(),
             )
-            .title(title.alignment(ratatui::layout::Alignment::Center));
-        
-        let block02 = Block::bordered()
-            .style(Style::new().cyan());
+            .split(area)
+            .to_vec();
 
-        let block_bottom_left = Block::bordered();
-        block_bottom_left.render(bottom01, buf);
+        for (i, gpu_info) in self.gpus.iter().enumerate() {
+            let gpu_chunks: Vec<Rect> = Layout::default()
+                .direction(ratatui::layout::Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+                .split(chunks[i])
+                .to_vec();
 
-        let block_bottom_right = Block::bordered();
-        block_bottom_right.render(bottom02, buf);
+            let clock_chunk = gpu_chunks[0];
+            let temp_chunk = gpu_chunks[1];
 
-        // We need to take the last 30 data points and turn it into an array of tuples that the ratatui chart can interpret
-        let gpu_clock_data: [(f64, f64); 30] = self.gpu_core_clock.iter().zip(-29..=0).map(|i| (i.1 as f64, *i.0 as f64)).collect::<Vec<(f64,f64)>>().try_into().unwrap();
-        let chart_gpu_clock_data = Dataset::default()
-            .name("GPU Clock")
-            .marker(Marker::Dot)
-            .graph_type(ratatui::widgets::GraphType::Line)
-            .data(&gpu_clock_data);
-        let chart_gpu_clock_x_axis = Axis::default().title("Time").bounds([-30.0, 0.0]);
-        let chart_gpu_clock_y_axis = Axis::default().title("GPU Clock Speed").bounds([0.0,2000.0]);
-        let chart_gpu_clock = Chart::new(vec![chart_gpu_clock_data])
-            .block(block01)
-            .x_axis(chart_gpu_clock_x_axis)
-            .y_axis(chart_gpu_clock_y_axis)
-            .style(Style::new().fg(ratatui::style::Color::Rgb(48,226,173)));
-        chart_gpu_clock.render(top01, buf);
+            let clock_title = Title::from(format!("NVIDIA GPU Clock - {}", gpu_info.device_name));
+            let clock_block = Block::bordered()
+                .border_style(Style::new().fg(ratatui::style::Color::Rgb(117, 255, 0)))
+                .title(clock_title.alignment(ratatui::layout::Alignment::Center));
 
+            let temp_title =
+                Title::from(format!("NVIDIA GPU Temperature - {}", gpu_info.device_name));
+            let temp_block = Block::bordered()
+                .border_style(Style::new().fg(ratatui::style::Color::Rgb(255, 0, 255)))
+                .title(temp_title.alignment(ratatui::layout::Alignment::Center));
 
-        let gpu_temperature_data: [(f64, f64); 30] = self.gpu_temperature.iter().zip(-29..=0).map(|i| (i.1 as f64, *i.0 as f64)).collect::<Vec<(f64, f64)>>().try_into().expect("Failed to format GPU temperature data for charting");
-        let chart_gpu_temperature_data = Dataset::default()
-            .name("GPU Temp")
-            .graph_type(ratatui::widgets::GraphType::Line)
-            .marker(Marker::Dot)
-            .data(&gpu_temperature_data);
-        let chart_gpu_temperature_x_axis = Axis::default().title("Time").bounds([-30.0, 0.0]);
-        let chart_gpu_temperature_y_axis = Axis::default().title("Temp").bounds([20.0, 85.0]).labels(["20".bold(), "85".bold()]);
-        let chart_gpu_temperature = Chart::new(vec![chart_gpu_temperature_data])
-            .block(block02)
-            .x_axis(chart_gpu_temperature_x_axis)
-            .y_axis(chart_gpu_temperature_y_axis)
-            .style(Style::new().fg(ratatui::style::Color::Rgb(48, 226, 173)));
-        chart_gpu_temperature.render(top02, buf);
-        
+            let gpu_clock_data: Vec<(f64, f64)> = gpu_info
+                .core_clock
+                .iter()
+                .zip(-29..=0)
+                .map(|(clock, time)| (time as f64, *clock as f64))
+                .collect();
+            let gpu_temperature_data: Vec<(f64, f64)> = gpu_info
+                .temperature
+                .iter()
+                .zip(-29..=0)
+                .map(|(temp, time)| (time as f64, *temp as f64))
+                .collect();
 
-    }
-}
+            let current_clock = gpu_info.core_clock[29].max(1); // Ensure the value is at least 1
+            let current_temp = gpu_info.temperature[29].max(1); // Ensure the value is at least 1
 
-// Legacy function, not currently being called anywhere.
-// Just used this to test retrieving certain values from the NVIDIA GPU.
-#[allow(dead_code)]
-fn get_nvidia_gpu_info() {
-    let nvml = nvml_wrapper::Nvml::init().expect("Failed to initialize NVML");
-    println!("You have {0} NVIDIA GPUs", nvml.device_count().expect("Failed to list NVIDIA GPUs"));
+            let current_clock_str = current_clock.to_string();
+            let current_temp_str = current_temp.to_string();
 
-    println!("NVIDIA Driver version: {0}", nvml.sys_driver_version().expect("Failed to retrieve NVIDIA driver version"));
-    println!("NVIDIA CUDA version: {0}", nvml.sys_cuda_driver_version().expect("Failed to retrieve NVIDIA CUDA version"));
+            let chart_gpu_clock_data = Dataset::default()
+                .name("GPU Clock")
+                .marker(Marker::Dot)
+                .graph_type(ratatui::widgets::GraphType::Line)
+                .data(&gpu_clock_data);
+            let chart_gpu_temperature_data = Dataset::default()
+                .name("GPU Temperature")
+                .marker(Marker::Dot)
+                .graph_type(ratatui::widgets::GraphType::Line)
+                .data(&gpu_temperature_data);
 
-    for gpu_index in 0..nvml.device_count().unwrap() {        
-        let gpu = nvml.device_by_index(gpu_index).expect("Failed to retrieve GPU with that index");
-        println!("{0}: GPU Architecture: {1}", gpu_index, gpu.architecture().expect("Failed to retrieve GPU architecture"));
-        println!("{0}: GPU Brand: {1:?}", gpu_index, gpu.brand().expect("Failed to get GPU brand"));
-        println!("{0}: 🌡️  GPU Temperature: {1:?} °C ", gpu_index, gpu.temperature(TemperatureSensor::Gpu).expect("Failed to retrieve GPU temperature"));
-        // println!("{0}: GPU Driver Model: {1:?}", gpu_index, gpu.driver_model().expect("Failed to retrieve GPU driver model").current);
-        println!("{0}: GPU Power Consumption: {1} watts", gpu_index, (gpu.power_usage().expect("Failed to get GPU power consumption")/1000) as f32);
-        
+            let chart_gpu_clock_x_axis = Axis::default()
+                .title("Time")
+                .bounds([-30.0, 0.0])
+                .labels(vec!["Time"]);
+            let chart_gpu_clock_y_axis = Axis::default()
+                .title("GPU Clock Speed")
+                .bounds([0.0, current_clock as f64])
+                .labels(vec![current_clock_str.as_str()]);
+
+            let chart_gpu_temperature_x_axis = Axis::default()
+                .title("Time")
+                .bounds([-30.0, 0.0])
+                .labels(vec!["Time"]);
+            let chart_gpu_temperature_y_axis = Axis::default()
+                .title("GPU Temperature")
+                .bounds([0.0, current_temp as f64])
+                .labels(vec![current_temp_str.as_str()]);
+
+            let chart_gpu_clock = Chart::new(vec![chart_gpu_clock_data])
+                .block(clock_block.clone())
+                .x_axis(chart_gpu_clock_x_axis)
+                .y_axis(chart_gpu_clock_y_axis)
+                .style(Style::new().fg(ratatui::style::Color::Rgb(48, 226, 173)));
+            chart_gpu_clock.render(clock_chunk, buf);
+
+            let chart_gpu_temperature = Chart::new(vec![chart_gpu_temperature_data])
+                .block(temp_block.clone())
+                .x_axis(chart_gpu_temperature_x_axis)
+                .y_axis(chart_gpu_temperature_y_axis)
+                .style(Style::new().fg(ratatui::style::Color::Rgb(255, 0, 255)));
+            chart_gpu_temperature.render(temp_chunk, buf);
+        }
     }
 }

@@ -11,3 +11,10 @@ homepage = "https://github.com/pcgeek86/nvidia-rs"
 crossterm = "0.28.1"
 nvml-wrapper = "0.10.0"
 ratatui = { version = "0.28.1", features = ["all-widgets"] }
+log = "0.4.22"
+env_logger = "0.11.5"
+
+[rust]
+debug = true
+debuginfo-level = 2
+
